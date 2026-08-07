@@ -14,6 +14,7 @@ import { parse } from 'libpg-query';
 import { BadRequestError, ForbiddenError } from './gateway-errors.js';
 import { capabilityAllows } from '../auth/token-auth.js';
 import { bannedFunctionName } from './banned-functions.js';
+import { sensitiveRelationMatch } from './sensitive-relations.js';
 
 export interface RelationRef {
     schema?: string;
@@ -138,6 +139,10 @@ export interface RelationPolicy {
     allowedSchemas: string[];
     /** Per-datasource denied tables: `table` | `schema.table`. */
     deniedTables: string[];
+    /** Apply the built-in secure-by-default sensitive-relation denylist
+     *  (sensitive-relations.ts) on top of `deniedTables`. Per-datasource; default true
+     *  in production config. Explicit here (not optional) so callers can't forget it. */
+    useBuiltinSensitiveDenylist: boolean;
 }
 
 const METADATA_HINT =
@@ -183,6 +188,16 @@ export async function assertRelationsAllowed(sql: string, policy: RelationPolicy
         const effective = ref.schema ?? policy.schema;
         if (isDenied(effective, ref.relation, policy.deniedTables))
             throw new BadRequestError(`Relation "${effective}.${ref.relation}" is on this datasource's denied-table list.`);
+
+        // Built-in safety net: block relations whose NAME looks like a credential/secret/
+        // token store, even when the operator configured no denylist. Merged with (runs
+        // after) the explicit list above; disable per-datasource if it false-positives.
+        if (policy.useBuiltinSensitiveDenylist && sensitiveRelationMatch(ref.relation))
+            throw new BadRequestError(
+                `Relation "${effective}.${ref.relation}" is blocked by the built-in sensitive-relation denylist ` +
+                    `(name looks like a credential/secret/token store). If this is a false positive, disable the ` +
+                    `built-in denylist for this datasource or add an explicit allow.`,
+            );
     }
 }
 

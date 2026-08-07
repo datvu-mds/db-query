@@ -140,3 +140,30 @@ test('DENIED_TABLES with a malformed entry (a.b.c) fails boot fast', () => {
     process.env.DS_MAIN_DENIED_TABLES = 'user, a.b.c';
     assert.throws(() => loadConfig(), /table.*or.*schema\.table|Invalid pg-connection-pool config/);
 });
+
+test('sensitiveRelationDenylist defaults to TRUE (secure-by-default)', () => {
+    minimalEnv();
+    delete process.env.DS_MAIN_SENSITIVE_RELATION_DENYLIST;
+    assert.equal(loadConfig().datasources[0].sensitiveRelationDenylist, true);
+});
+
+test('SENSITIVE_RELATION_DENYLIST=false turns the built-in off', () => {
+    minimalEnv();
+    process.env.DS_MAIN_SENSITIVE_RELATION_DENYLIST = 'false';
+    assert.equal(loadConfig().datasources[0].sensitiveRelationDenylist, false);
+    delete process.env.DS_MAIN_SENSITIVE_RELATION_DENYLIST;
+});
+
+test('SENSITIVE_RELATION_DENYLIST is fail-CLOSED: a typo like "1" keeps it ON', () => {
+    minimalEnv();
+    for (const v of ['1', 'yes', 'on', 'enabled', 'True']) {
+        process.env.DS_MAIN_SENSITIVE_RELATION_DENYLIST = v;
+        assert.equal(loadConfig().datasources[0].sensitiveRelationDenylist, true, `value=${v}`);
+    }
+    // only explicit off-values disable it
+    for (const v of ['false', '0', 'no', 'off']) {
+        process.env.DS_MAIN_SENSITIVE_RELATION_DENYLIST = v;
+        assert.equal(loadConfig().datasources[0].sensitiveRelationDenylist, false, `value=${v}`);
+    }
+    delete process.env.DS_MAIN_SENSITIVE_RELATION_DENYLIST;
+});

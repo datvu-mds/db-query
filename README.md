@@ -347,11 +347,23 @@ cannot be revoked, and grants are additive so tables cannot be carved out of
   real table). Decoded identifiers close the `U&"\0070g_read_file"` / `U&"\0075ser"`
   unicode-escape gap a lexer cannot. **Unparseable SQL is rejected (400)** — SQL the gateway
   cannot understand is SQL it cannot police (fail-closed).
-- **Four relation rules:** a relation qualified with a **system schema** (`pg_catalog`,
+- **Five relation rules:** a relation qualified with a **system schema** (`pg_catalog`,
   `pg_toast`, `pg_temp*`, `information_schema`) → **400**; qualified with **another schema
   outside the token's `SCHEMAS` caps** → **403**; an **unqualified `pg_%`** name (which
   resolves to `pg_catalog`, implicitly first on `search_path`) → **400**; the effective
-  schema + relation on the datasource's **`DS_<NAME>_DENIED_TABLES`** list → **400**.
+  schema + relation on the datasource's **`DS_<NAME>_DENIED_TABLES`** list → **400**; and a
+  relation whose **name matches the built-in sensitive-relation denylist** → **400**.
+- **Built-in sensitive-relation denylist (secure-by-default).** Because `DS_<NAME>_DENIED_TABLES`
+  ships empty, a name-pattern safety net ([`sensitive-relations.ts`](src/query/sensitive-relations.ts))
+  blocks obvious credential/secret/token/key stores (`secrets`, `api_keys`, `oauth_tokens`,
+  `private_keys`, `recovery_codes`, `mfa_secrets`, `vault`, …) even when no denylist is
+  configured. It is a token-boundary match (`user_secrets`, `oauth_access_tokens` are caught),
+  with a small curated set of zero-false-friend roots (`credential`, `apikey`, `password`)
+  also matched as a substring so glued compounds (`credentialstore`) are caught, and it
+  deliberately excludes generic identity tables (`users`, `accounts`, `sessions`) to avoid
+  over-blocking ordinary reads. Default on, fail-closed — only an explicit
+  `DS_<NAME>_SENSITIVE_RELATION_DENYLIST=false`/`0`/`no`/`off` turns it off (boot WARNs when
+  it does); skipped by `ALLOW_UNSAFE_STATEMENTS`.
 - **Metadata path.** `list_schemas` / `list_tables` / `describe_table` are the sanctioned,
   caps-filtered way to see structure. They run fixed, parameterized `information_schema`
   reads on an **internal trusted route** that a caller cannot request — the trust flag is a
@@ -363,6 +375,13 @@ cannot be revoked, and grants are additive so tables cannot be carved out of
 
 Rejections (both 400 and 403) are **audited** — a qualified cross-schema 403 is the
 tenant-probe signal worth alerting on.
+
+**Error redaction.** Error text returned to a caller (MCP tool result / HTTP body) is run
+through [`redact-error.ts`](src/query/redact-error.ts): connection URIs, `password=`/`user=…`
+params, pg auth-failure user names, and `getaddrinfo`/`connect` host/address details are
+masked, so a connection failure can never echo connection metadata to the LLM. The full
+detail still goes to the server-side audit log. Useful SQL errors (syntax, undefined column)
+pass through unchanged.
 
 **Residual risks (accepted).** A **view** in an allowed schema over a denied table still
 reads it (views run with owner privileges; no such views are known — the DB-grants runbook

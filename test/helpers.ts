@@ -34,6 +34,9 @@ export function makeConfig(overrides: Partial<RootConfig> = {}): RootConfig {
                 maxUses: 7500,
                 allowUnsafeStatements: false,
                 deniedTables: [],
+                // Off in the shared fixture so existing tests exercise the config
+                // denylist / caps in isolation; the built-in has its own opt-in tests.
+                sensitiveRelationDenylist: false,
             },
         ],
         tokens: [

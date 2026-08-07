@@ -106,6 +106,9 @@ const policy = (over: Partial<RelationPolicy> = {}): RelationPolicy => ({
     schema: 'public',
     allowedSchemas: ['*'],
     deniedTables: [],
+    // Default OFF here so the existing tests exercise the config denylist / caps / catalog
+    // block in isolation. The built-in denylist has its own opt-in tests below.
+    useBuiltinSensitiveDenylist: false,
     ...over,
 });
 const rejects400 = (sql: string, p = policy()) =>
@@ -192,4 +195,50 @@ test('policy: write/create TARGETS are policed against caps and the denylist', a
     // legitimate own-tenant write still passes (qualified and unqualified)
     await allows('INSERT INTO tenant_a.orders VALUES (1)', scoped);
     await allows('INSERT INTO orders VALUES (1)', scoped);
+});
+
+// ── Built-in sensitive-relation denylist ──────────────────────────────────────────
+const builtin = (over: Partial<RelationPolicy> = {}) => policy({ useBuiltinSensitiveDenylist: true, ...over });
+
+test('built-in denylist: secret/credential/token/key stores → 400 (even with empty deniedTables)', async () => {
+    for (const rel of [
+        'secrets',
+        'client_secrets',
+        'user_secrets',
+        'passwords',
+        'password_hashes',
+        'credentials',
+        'api_keys',
+        'apikey',
+        'oauth_access_tokens',
+        'refresh_tokens',
+        'personal_access_tokens',
+        'private_keys',
+        'ssh_keys',
+        'recovery_codes',
+        'mfa_secrets',
+        'login_otp',
+        'user_vault',
+    ]) {
+        await rejects400(`SELECT * FROM "${rel}"`, builtin());
+    }
+});
+
+test('built-in denylist: caught inside CTE body / JOIN / subquery / write target', async () => {
+    await rejects400('WITH x AS (SELECT * FROM api_keys) SELECT * FROM x', builtin());
+    await rejects400('SELECT * FROM t JOIN oauth_tokens o ON true', builtin());
+    await rejects400('SELECT * FROM t WHERE id IN (SELECT id FROM credentials)', builtin());
+    await rejects400('DELETE FROM refresh_tokens WHERE id = 1', builtin({ allowedSchemas: ['public'] }));
+});
+
+test('built-in denylist: ordinary business tables pass (no over-block on generic identity)', async () => {
+    for (const rel of ['users', 'accounts', 'sessions', 'tokens', 'orders', 'customers', 'products', 'invoices', 'user_profiles', 'account_settings']) {
+        await allows(`SELECT * FROM "${rel}"`, builtin());
+    }
+});
+
+test('built-in denylist: off ⇒ sensitive names pass (config denylist still governs)', async () => {
+    await allows('SELECT * FROM api_keys', policy({ useBuiltinSensitiveDenylist: false }));
+    // but an explicit deniedTables entry still blocks, independent of the built-in
+    await rejects400('SELECT * FROM api_keys', policy({ useBuiltinSensitiveDenylist: false, deniedTables: ['api_keys'] }));
 });
