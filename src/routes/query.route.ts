@@ -9,6 +9,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Services } from '../services.js';
 import { queryRequestSchema } from '../query/query.schema.js';
 import { statusOf } from '../query/gateway-errors.js';
+import { redactErrorMessage } from '../query/redact-error.js';
 import { authenticate, parseBody, datasourceReady } from './route-helpers.js';
 
 export function registerQueryRoute(app: FastifyInstance, s: Services): void {
@@ -38,7 +39,7 @@ export function registerQueryRoute(app: FastifyInstance, s: Services): void {
             });
             return reply.code(200).send(response);
         } catch (err) {
-            return reply.code(statusOf(err)).send({ error: (err as Error).message });
+            return reply.code(statusOf(err)).send({ error: redactErrorMessage(err) });
         }
     });
 }

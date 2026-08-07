@@ -194,6 +194,17 @@ export async function assertReadOnlyPosture(services: Services, identity?: strin
                 `relation guard ENFORCED for datasource "${datasource}" — catalog/information_schema blocked in ` +
                     `run_query, ${dsCfg.deniedTables.length} denied table pattern(s)`,
             );
+            // The built-in sensitive-relation denylist is secure-by-default; disabling it
+            // re-exposes credential/secret/token tables (unless listed in DENIED_TABLES),
+            // so make that switch as loud as ALLOW_UNSAFE_STATEMENTS.
+            if (!dsCfg.sensitiveRelationDenylist) {
+                log.warn(
+                    { datasource, sensitiveRelationDenylist: false },
+                    `built-in sensitive-relation denylist DISABLED for datasource "${datasource}" ` +
+                        '(SENSITIVE_RELATION_DENYLIST=false) — credential/secret/token tables are readable ' +
+                        'unless explicitly listed in DENIED_TABLES',
+                );
+            }
         }
 
         const writeTokens = writeTokensFor(services.config.tokens, datasource);

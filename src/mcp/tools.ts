@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Services } from '../services.js';
 import type { Capabilities } from '../auth/token-auth.js';
+import { redactErrorMessage } from '../query/redact-error.js';
 
 interface ToolResult {
     // Index signature matches the SDK's CallToolResult (a passthrough object).
@@ -75,7 +76,7 @@ export function registerTools(server: McpServer, s: Services, caps: Capabilities
                 });
                 return ok(response);
             } catch (e) {
-                return fail((e as Error).message);
+                return fail(redactErrorMessage(e));
             }
         },
     );
@@ -93,7 +94,7 @@ export function registerTools(server: McpServer, s: Services, caps: Capabilities
                 if (!s.pools.names().includes(args.datasource)) throw new Error(`unknown datasource "${args.datasource}"`);
                 return ok({ schemas: await s.introspectService.listSchemas(caps, args.datasource) });
             } catch (e) {
-                return fail((e as Error).message);
+                return fail(redactErrorMessage(e));
             }
         },
     );
@@ -113,7 +114,7 @@ export function registerTools(server: McpServer, s: Services, caps: Capabilities
                 const schema = authorize(s, caps, args.datasource, args.schema, false);
                 return ok({ tables: await s.introspectService.listTables(caps.id, args.datasource, schema) });
             } catch (e) {
-                return fail((e as Error).message);
+                return fail(redactErrorMessage(e));
             }
         },
     );
@@ -134,7 +135,7 @@ export function registerTools(server: McpServer, s: Services, caps: Capabilities
                 const schema = authorize(s, caps, args.datasource, args.schema, false);
                 return ok({ columns: await s.introspectService.describeTable(caps.id, args.datasource, schema, args.table) });
             } catch (e) {
-                return fail((e as Error).message);
+                return fail(redactErrorMessage(e));
             }
         },
     );

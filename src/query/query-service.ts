@@ -126,6 +126,7 @@ export class QueryService {
                     schema: input.schema,
                     allowedSchemas: input.allowedSchemas ?? [input.schema],
                     deniedTables: dsCfg.deniedTables,
+                    useBuiltinSensitiveDenylist: dsCfg.sensitiveRelationDenylist,
                 });
             } catch (err) {
                 this.auditError(input, started, (err as Error).message);
@@ -146,9 +147,11 @@ export class QueryService {
         try {
             conn = await this.driver.connect(input.datasource);
         } catch (err) {
-            const msg = `datasource "${input.datasource}" unavailable: ${(err as Error).message}`;
-            this.auditError(input, started, msg);
-            throw new ServiceUnavailableError(msg);
+            // The raw driver error on a connect failure can carry connection metadata
+            // (host/user/db). Keep that DETAIL in the server-side audit log, but return
+            // ONLY a generic message to the caller — never echo credentials to the LLM.
+            this.auditError(input, started, `datasource "${input.datasource}" unavailable: ${(err as Error).message}`);
+            throw new ServiceUnavailableError(`datasource "${input.datasource}" unavailable`);
         }
 
         // If even ROLLBACK fails the connection's state is uncertain — destroy it

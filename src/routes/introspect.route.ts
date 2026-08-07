@@ -8,6 +8,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Services } from '../services.js';
 import { schemasRequestSchema, tablesRequestSchema, describeRequestSchema } from '../introspect/introspect.schema.js';
 import { statusOf } from '../query/gateway-errors.js';
+import { redactErrorMessage } from '../query/redact-error.js';
 import { authenticate, parseBody, datasourceReady } from './route-helpers.js';
 
 export function registerIntrospectRoutes(app: FastifyInstance, s: Services): void {
@@ -21,7 +22,7 @@ export function registerIntrospectRoutes(app: FastifyInstance, s: Services): voi
             const schemas = await s.introspectService.listSchemas(caps, body.datasource);
             return reply.code(200).send({ schemas });
         } catch (err) {
-            return reply.code(statusOf(err)).send({ error: (err as Error).message });
+            return reply.code(statusOf(err)).send({ error: redactErrorMessage(err) });
         }
     });
 
@@ -37,7 +38,7 @@ export function registerIntrospectRoutes(app: FastifyInstance, s: Services): voi
             const tables = await s.introspectService.listTables(caps.id, body.datasource, body.schema);
             return reply.code(200).send({ tables });
         } catch (err) {
-            return reply.code(statusOf(err)).send({ error: (err as Error).message });
+            return reply.code(statusOf(err)).send({ error: redactErrorMessage(err) });
         }
     });
 
@@ -53,7 +54,7 @@ export function registerIntrospectRoutes(app: FastifyInstance, s: Services): voi
             const columns = await s.introspectService.describeTable(caps.id, body.datasource, body.schema, body.table);
             return reply.code(200).send({ columns });
         } catch (err) {
-            return reply.code(statusOf(err)).send({ error: (err as Error).message });
+            return reply.code(statusOf(err)).send({ error: redactErrorMessage(err) });
         }
     });
 }

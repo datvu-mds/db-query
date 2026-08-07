@@ -40,6 +40,11 @@ export const datasourceSchema = z.object({
     deniedTables: z
         .array(z.string().min(1).regex(/^[^.]+(\.[^.]+)?$/, 'expected "table" or "schema.table"'))
         .default([]),
+    // Built-in secure-by-default sensitive-relation denylist (sensitive-relations.ts),
+    // merged with deniedTables. Default TRUE: obvious credential/secret/token tables are
+    // blocked even when deniedTables is empty. Set false to rely on deniedTables alone.
+    // Skipped by allowUnsafeStatements, like the rest of the relation guard.
+    sensitiveRelationDenylist: z.boolean().default(true),
 });
 
 export const tokenSchema = z.object({

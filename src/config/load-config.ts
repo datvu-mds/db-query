@@ -32,6 +32,15 @@ function bool(v: string | undefined): boolean | undefined {
     return v.toLowerCase() === 'true';
 }
 
+/** Fail-CLOSED boolean for secure-by-default toggles: undefined ⇒ undefined (zod default
+ *  true applies); an explicit off value ("false"/"0"/"no"/"off") ⇒ false; ANY other value
+ *  ⇒ true. A typo like "1" or "enabled" keeps the safety net ON instead of silently
+ *  disabling it (the asymmetry that made a plain `bool()` fail-open here). */
+function boolSecureDefault(v: string | undefined): boolean | undefined {
+    if (v === undefined) return undefined;
+    return !['false', '0', 'no', 'off'].includes(v.toLowerCase());
+}
+
 function buildDatasource(name: string): Record<string, unknown> {
     const p = `DS_${name.toUpperCase()}_`;
     return {
@@ -50,6 +59,7 @@ function buildDatasource(name: string): Record<string, unknown> {
         maxUses: env(`${p}MAX_USES`),
         allowUnsafeStatements: bool(env(`${p}ALLOW_UNSAFE_STATEMENTS`)),
         deniedTables: list(env(`${p}DENIED_TABLES`)),
+        sensitiveRelationDenylist: boolSecureDefault(env(`${p}SENSITIVE_RELATION_DENYLIST`)),
     };
 }
 
@@ -66,6 +76,7 @@ function fallbackDatasource(): Record<string, unknown> {
         defaultSchema: env('DATABASE_DEFAULT_SCHEMA'),
         allowUnsafeStatements: bool(env('DATABASE_ALLOW_UNSAFE_STATEMENTS')),
         deniedTables: list(env('DATABASE_DENIED_TABLES')),
+        sensitiveRelationDenylist: boolSecureDefault(env('DATABASE_SENSITIVE_RELATION_DENYLIST')),
     };
 }
 
