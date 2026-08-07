@@ -242,3 +242,47 @@ test('built-in denylist: off ⇒ sensitive names pass (config denylist still gov
     // but an explicit deniedTables entry still blocks, independent of the built-in
     await rejects400('SELECT * FROM api_keys', policy({ useBuiltinSensitiveDenylist: false, deniedTables: ['api_keys'] }));
 });
+
+// ── Connection-identity functions (always on; the run_query "who am I" leak) ────────
+test('identity functions: keyword forms (SQLValueFunction) → 400', async () => {
+    // These parse to SQLValueFunction ops, not FuncCall — the regression this guards.
+    for (const sql of ['SELECT current_user', 'SELECT session_user', 'SELECT current_role', 'SELECT user', 'SELECT current_catalog', 'SELECT current_schema']) {
+        await rejects400(sql);
+    }
+});
+
+test('identity functions: call forms (FuncCall) → 400', async () => {
+    for (const sql of [
+        'SELECT current_database()',
+        'SELECT current_schemas(true)',
+        'SELECT inet_server_addr()',
+        'SELECT inet_server_port()',
+        'SELECT inet_client_addr()',
+        'SELECT inet_client_port()',
+    ]) {
+        await rejects400(sql);
+    }
+});
+
+test('identity functions: caught inside projection / WHERE / qualified name', async () => {
+    await rejects400('SELECT id FROM t WHERE owner = current_user', policy({ allowedSchemas: ['public'] }));
+    await rejects400('SELECT pg_catalog.current_database()'); // qualifier ignored, still blocked
+    await rejects400('SELECT current_user FROM t');
+});
+
+test('current_setting: identity GUCs (and non-literal args) → 400; harmless GUCs pass', async () => {
+    await rejects400("SELECT current_setting('session_authorization')");
+    await rejects400("SELECT current_setting('role')");
+    await rejects400("SELECT current_setting('SESSION_AUTHORIZATION')"); // case-insensitive
+    await rejects400('SELECT current_setting(colname) FROM t', policy({ allowedSchemas: ['public'] })); // non-literal → fail-closed
+    await allows("SELECT current_setting('statement_timeout')");
+    await allows("SELECT current_setting('search_path')");
+});
+
+test('identity guard: date/time and ordinary functions are NOT blocked', async () => {
+    await allows('SELECT now(), current_date, current_timestamp, localtime');
+    await allows('SELECT * FROM t WHERE created_at > now()', policy({ allowedSchemas: ['public'] }));
+    await allows('SELECT count(*), max(v) FROM t', policy({ allowedSchemas: ['public'] }));
+    // a column/table literally named "user" (identifier, not the keyword) is unaffected
+    await allows('SELECT "user" FROM t', policy({ allowedSchemas: ['public'] }));
+});

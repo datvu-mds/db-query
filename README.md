@@ -364,6 +364,18 @@ cannot be revoked, and grants are additive so tables cannot be carved out of
   over-blocking ordinary reads. Default on, fail-closed — only an explicit
   `DS_<NAME>_SENSITIVE_RELATION_DENYLIST=false`/`0`/`no`/`off` turns it off (boot WARNs when
   it does); skipped by `ALLOW_UNSAFE_STATEMENTS`.
+- **Connection-identity functions blocked (secure-by-default, always on).** `run_query`
+  returns table *data*; it must not answer "who / where am I?". Identity functions
+  ([`connection-info-functions.ts`](src/query/connection-info-functions.ts)) that would read
+  back the datasource's real **user / database / host** — `current_user`, `session_user`,
+  `current_role`, `user`, `current_database`, `current_catalog`, `current_schema(s)`,
+  `inet_server_*` / `inet_client_*` — are rejected (**400**). Both parse shapes are covered:
+  the keyword forms are `SQLValueFunction` nodes, the call forms `FuncCall`. `current_setting`
+  is allowed **except** for the identity GUCs `session_authorization` / `role` (and a
+  non-literal argument fails closed) — so `current_setting('session_authorization')` cannot be
+  used as a back door to the session user. Date/time value functions (`now()`, `current_date`,
+  …) carry no identity and pass. This closes the `SELECT current_user, current_database()`
+  path an agent could otherwise use to disclose the values `.env` holds.
 - **Metadata path.** `list_schemas` / `list_tables` / `describe_table` are the sanctioned,
   caps-filtered way to see structure. They run fixed, parameterized `information_schema`
   reads on an **internal trusted route** that a caller cannot request — the trust flag is a
@@ -385,9 +397,12 @@ pass through unchanged.
 
 **Residual risks (accepted).** A **view** in an allowed schema over a denied table still
 reads it (views run with owner privileges; no such views are known — the DB-grants runbook
-is the durable fix). Scalar metadata functions (`version()`, `current_setting()`,
-`current_user`) stay readable — not table data. And this is app-layer enforcement over a
-shared `pg_read_all_data` role: it holds only as long as the guard does. The belt exists;
+is the durable fix). Connection-identity functions (`current_user`, `current_database()`,
+`inet_server_*`, `current_setting('session_authorization')`) are now blocked (above), but
+non-identity scalar metadata such as `version()` and other `current_setting('<guc>')` reads
+stay readable — server fingerprint, not connection identity or table data. And this is
+app-layer enforcement over a shared `pg_read_all_data` role: it holds only as long as the
+guard does. The belt exists;
 explicit per-token grants ([runbook](docs/runbooks/agent-ro-pg-role.md)) are the braces.
 
 ### Network binding

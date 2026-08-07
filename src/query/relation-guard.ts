@@ -15,6 +15,7 @@ import { BadRequestError, ForbiddenError } from './gateway-errors.js';
 import { capabilityAllows } from '../auth/token-auth.js';
 import { bannedFunctionName } from './banned-functions.js';
 import { sensitiveRelationMatch } from './sensitive-relations.js';
+import { connectionInfoFunction, SQL_VALUE_FUNCTION_NAMES, sensitiveSettingArg } from './connection-info-functions.js';
 
 export interface RelationRef {
     schema?: string;
@@ -23,6 +24,9 @@ export interface RelationRef {
 export interface SqlRefs {
     relations: RelationRef[];
     functions: string[];
+    /** Literal argument of every current_setting('<guc>') call — the lowercased GUC
+     *  name, or null when the argument is not a plain string constant (fail-closed). */
+    settingArgs: (string | null)[];
 }
 
 /**
@@ -32,7 +36,7 @@ export interface SqlRefs {
  */
 export async function extractSqlRefs(sql: string): Promise<SqlRefs> {
     const tree = await parse(sql); // { version, stmts: [{ stmt }] }
-    const out: SqlRefs = { relations: [], functions: [] };
+    const out: SqlRefs = { relations: [], functions: [], settingArgs: [] };
     walk(tree.stmts, new Set<string>(), out);
     return out;
 }
@@ -76,6 +80,12 @@ function walk(node: unknown, scope: ReadonlySet<string>, out: SqlRefs): void {
             continue;
         }
         if (key === 'FuncCall') collectFunction(value as Node, out); // fall through: walk args too
+        if (key === 'SQLValueFunction') {
+            // Keyword identity forms (current_user, current_catalog, …) — no funcname
+            // and no children of interest, so collect and skip recursing this subtree.
+            collectValueFunction(value as Node, out);
+            continue;
+        }
         walk(value, childScope, out);
     }
 }
@@ -127,7 +137,30 @@ function collectFunction(fc: Node, out: SqlRefs): void {
     const parts = Array.isArray(fc.funcname) ? fc.funcname : [];
     const last = parts[parts.length - 1] as Node | undefined;
     const sval = (last?.String as Node | undefined)?.sval;
-    if (typeof sval === 'string' && sval !== '') out.functions.push(sval);
+    if (typeof sval !== 'string' || sval === '') return;
+    out.functions.push(sval);
+    // current_setting('<guc>') can alias connection identity (session_authorization →
+    // session user); capture its literal argument (null when not a plain string const)
+    // so the policy can reject the sensitive GUCs while allowing the harmless ones.
+    if (sval.toLowerCase() === 'current_setting') out.settingArgs.push(firstStringLiteralArg(fc));
+}
+
+/** First argument of a FuncCall as a plain string literal (A_Const.sval.sval), or null
+ *  when there is no such literal — a dynamic/expression argument is treated as unknown. */
+function firstStringLiteralArg(fc: Node): string | null {
+    const args = Array.isArray(fc.args) ? fc.args : [];
+    const aConst = (args[0] as Node | undefined)?.A_Const as Node | undefined;
+    const sval = (aConst?.sval as Node | undefined)?.sval;
+    return typeof sval === 'string' ? sval : null;
+}
+
+/** SQLValueFunction carries an `op` (e.g. SVFOP_CURRENT_USER) instead of a funcname.
+ *  Map the identity-revealing ops to their canonical name so the ONE function denylist
+ *  in assertRelationsAllowed covers both node shapes; unmapped ops (date/time) drop. */
+function collectValueFunction(vf: Node, out: SqlRefs): void {
+    const op = typeof vf.op === 'string' ? vf.op : '';
+    const name = SQL_VALUE_FUNCTION_NAMES[op];
+    if (name) out.functions.push(name);
 }
 
 // ── Policy ──────────────────────────────────────────────────────────────────────
@@ -172,6 +205,24 @@ export async function assertRelationsAllowed(sql: string, policy: RelationPolicy
 
     for (const name of refs.functions) {
         if (bannedFunctionName(name)) throw new BadRequestError(`Function "${name}" is not permitted by this gateway.`);
+        // Connection-identity functions (current_user, current_database(), inet_server_*, …)
+        // reveal WHO/WHERE the datasource connects as. run_query returns table data only —
+        // structure comes from the introspection tools, not from probing the connection.
+        if (connectionInfoFunction(name))
+            throw new BadRequestError(
+                `Function "${name}" is not permitted by this gateway: it reveals connection identity ` +
+                    `(user / database / host). run_query returns table data only.`,
+            );
+    }
+
+    // current_setting('session_authorization' | 'role') is the same identity leak as
+    // session_user / current_role by another name; a non-literal argument fails closed.
+    for (const arg of refs.settingArgs) {
+        if (sensitiveSettingArg(arg))
+            throw new BadRequestError(
+                `current_setting(${arg === null ? '<non-literal argument>' : `'${arg}'`}) is not permitted: ` +
+                    `it would reveal connection identity.`,
+            );
     }
 
     for (const ref of refs.relations) {
