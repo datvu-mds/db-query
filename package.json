@@ -1,0 +1,37 @@
+{
+    "name": "pg-connection-pool",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Query-execution gateway — owns pg pools, exposes a guarded QUERY capability over HTTP (and MCP). Callers know a logical datasource name + SQL, never a connection or credentials.",
+    "type": "module",
+    "bin": {
+        "pg-connection-pool-mcp": "dist/mcp/mcp-server.js"
+    },
+    "scripts": {
+        "dev": "tsx watch src/server.ts",
+        "build": "tsc -p tsconfig.json",
+        "start": "node --env-file-if-exists=.env dist/server.js",
+        "start:mcp": "node --env-file-if-exists=.env dist/mcp/mcp-server.js",
+        "start:mcp:http": "MCP_TRANSPORT=http node --env-file-if-exists=.env dist/mcp/mcp-server.js",
+        "inspect": "npm run build && npx @modelcontextprotocol/inspector node --env-file-if-exists=.env dist/mcp/mcp-server.js",
+        "typecheck": "tsc --noEmit -p tsconfig.json",
+        "test": "node --import tsx --test \"test/**/*.test.ts\""
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.29.0",
+        "fastify": "^5.2.0",
+        "libpg-query": "^18.1.4",
+        "pg": "^8.13.0",
+        "pino": "^9.5.0",
+        "zod": "3.25.76"
+    },
+    "devDependencies": {
+        "@types/node": "^22.10.0",
+        "@types/pg": "^8.11.0",
+        "tsx": "^4.19.0",
+        "typescript": "^5.7.0"
+    },
+    "engines": {
+        "node": ">=20"
+    }
+}

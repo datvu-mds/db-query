@@ -1,0 +1,81 @@
+# Local PostgreSQL 18 for the query gateway.
+#
+# Values come from `.env` (Compose auto-loads it from this directory for ${...}
+# interpolation), so credentials live in exactly one place and this file holds no
+# secrets — it is safe to commit while `.env` stays gitignored.
+#
+# The DS_MAIN_* vars are the gateway's view of its datasource; here they are
+# mapped onto the POSTGRES_* names the official image expects. `:?` makes a missing
+# value a clear startup error rather than an accidentally password-less superuser.
+#
+# Only POSTGRES_* are passed in. The rest of `.env` (bearer secrets, MCP_TOKEN) is
+# deliberately NOT injected — the database has no use for them, and copying secrets
+# into more processes than need them is how they leak.
+#
+#   docker compose up -d          start
+#   docker compose logs -f pg     watch
+#   docker compose down           stop (data survives)
+#   docker compose down -v        stop AND delete the volume
+#
+# NOTE: `.env` currently points at the remote dev DB (home.zodinet.tech). To use this
+# container instead, set DS_MAIN_HOST=localhost. The published port is taken from
+# DS_MAIN_PORT, so nothing else needs to change. See README → Local Postgres.
+
+services:
+    pg:
+        image: postgres:18-alpine
+        container_name: pgcp-postgres
+        restart: unless-stopped
+
+        environment:
+            # Superuser created on first boot = the gateway's configured identity.
+            POSTGRES_USER: ${DS_MAIN_USER:?set DS_MAIN_USER in .env}
+            POSTGRES_PASSWORD: ${DS_MAIN_PASSWORD:?set DS_MAIN_PASSWORD in .env}
+            POSTGRES_DB: ${DS_MAIN_DATABASE:?set DS_MAIN_DATABASE in .env}
+            # Set explicitly rather than relying on the image default, which has moved
+            # between major versions. Pairs with the volume mount below: the data lives
+            # in a subdirectory so the mount point itself never has to be empty.
+            PGDATA: /var/lib/postgresql/data/pgdata
+            # scram-sha-256 for TCP is already the modern default; stated so a future
+            # image default cannot silently downgrade it to md5. `--auth-local` is left
+            # alone on purpose — the image initialises the unix socket as `trust`, which
+            # is what makes `docker compose exec pg psql -U <user>` work without a
+            # password. Overriding it buys nothing (you must already be in the container).
+            POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+
+        ports:
+            # Bound to LOOPBACK on purpose. A bare "5432:5432" publishes on every
+            # interface, which would expose the database to the local network — the same
+            # footgun `src/config/bind-guard.ts` refuses for the gateway itself. The host
+            # port mirrors DS_MAIN_PORT so only DS_MAIN_HOST needs changing.
+            - '127.0.0.1:${DS_MAIN_PORT:-5432}:5432'
+
+        volumes:
+            - pgdata:/var/lib/postgresql/data
+
+        # The gateway does a fail-fast boot ping, so it must not start against a
+        # still-initialising server. `depends_on: {pg: {condition: service_healthy}}`
+        # in any consumer becomes reliable once this reports healthy.
+        healthcheck:
+            test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1']
+            interval: 5s
+            timeout: 5s
+            retries: 10
+            start_period: 30s
+
+        # The image's default 64MB /dev/shm is not enough for parallel query workers,
+        # which fail with "could not resize shared memory segment".
+        shm_size: 256mb
+
+        # The gateway clamps per-statement timeouts, but a server-side backstop means a
+        # runaway query cannot pin a connection even if it arrives from somewhere else.
+        command:
+            - postgres
+            - -c
+            - max_connections=100
+            - -c
+            - idle_in_transaction_session_timeout=60000
+
+volumes:
+    pgdata:
+        name: pgcp-pgdata
