@@ -1,0 +1,21 @@
+// Type-checking config for the TEST suite.
+//
+// The base tsconfig deliberately scopes `rootDir`/`include` to `src/**` because it
+// also drives the `dist/` build — tests must never be emitted. But that left the
+// test suite completely unchecked: `npm test` runs through `tsx`, which STRIPS
+// types without checking them, so a type error in a test file surfaced only as a
+// runtime failure, or not at all. This config closes that gap: same strictness,
+// no emit, and `test/**` in scope.
+//
+// Run via `npm run typecheck:test` (or `npm run typecheck:all` for both).
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "noEmit": true,
+        // rootDir must widen to the repo root: the base pins it to `src`, which
+        // errors as soon as a `test/**` file enters the program.
+        "rootDir": "."
+    },
+    "include": ["src/**/*.ts", "test/**/*.ts"],
+    "exclude": ["node_modules", "dist"]
+}

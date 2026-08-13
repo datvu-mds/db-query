@@ -9,14 +9,23 @@
  */
 import pino from 'pino';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { loadConfig } from '../config/load-config.js';
+import { resolveConfig } from '../config/config-sources.js';
 import { buildServices } from '../services.js';
 import { createMcpServer } from './create-mcp-server.js';
 import { startMcpHttp } from './mcp-http.js';
 import { assertReadOnlyPosture } from '../boot/assert-readonly-posture.js';
+import { installReloadOnSighup } from '../config/reload.js';
+
+/** Cap on waiting for an in-flight reload during shutdown. Below any sane
+ *  orchestrator grace period, so we drain deliberately rather than being SIGKILLed. */
+const SHUTDOWN_RELOAD_WAIT_MS = 5000;
 
 async function main(): Promise<void> {
-    const config = loadConfig();
+    // resolveConfig, NOT loadConfig: boot must read `datasources.d/` too. Reading only
+    // `process.env` here is what made a directory-defined datasource exist solely after a
+    // SIGHUP — vanishing on the next restart, or failing boot outright when a token named
+    // it. Boot and reload now gather sources through the one function.
+    const config = resolveConfig();
     // pino defaults to fd 1, which on the stdio transport IS the JSON-RPC channel —
     // an audit or pool-error line written there corrupts the stream. Pin the sink to
     // stderr (fd 2) so the "all human-readable output goes to stderr" rule above
@@ -51,8 +60,16 @@ async function main(): Promise<void> {
     // backstop. Non-fatal by design (see assert-readonly-posture.ts).
     await assertReadOnlyPosture(services, caps.id);
 
+    // SIGHUP reloads datasources and token grants in place. `liveCaps` is the capability
+    // object registerTools() closes over: refreshing it in place is what lets an
+    // already-connected agent see new grants without reconnecting /mcp. `mcpToken` makes
+    // stage 1 REFUSE any reload that would invalidate this process's own identity —
+    // catching a rotated secret, not just a removed token.
+    const reloader = installReloadOnSighup(services, { liveCaps: caps, mcpToken: token, identity: caps.id });
+
     const shutdown = async (signal: string): Promise<void> => {
         console.error(`[pg-connection-pool-mcp] ${signal} — draining pools`);
+        await reloader.idle(SHUTDOWN_RELOAD_WAIT_MS);
         await services.pools.drainAll();
         process.exit(0);
     };

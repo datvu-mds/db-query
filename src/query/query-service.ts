@@ -27,7 +27,7 @@ import type { QueryResponse } from './query.schema.js';
 import { assertSingleStatement } from './single-statement.js';
 import { assertStatementAllowed } from './statement-guard.js';
 import { assertRelationsAllowed } from './relation-guard.js';
-import { BadRequestError, ServiceUnavailableError } from './gateway-errors.js';
+import { BadRequestError, ForbiddenError, ServiceUnavailableError } from './gateway-errors.js';
 
 /** idle_in_transaction_session_timeout is kept above statement_timeout so a
  *  long-but-progressing query isn't killed for "idling"; it fires only on a truly
@@ -101,6 +101,31 @@ export class QueryService {
         }
 
         const dsCfg = this.pools.getConfig(input.datasource);
+
+        // THIRD write gate, and the only DATASOURCE-scoped one. The first two are token-
+        // scoped and live in TokenAuth.authorize (write-mode token, plus an explicit
+        // readOnly:false per request), so `input.write === true` already means both passed
+        // — this asks the separate question of whether THIS datasource accepts writes at
+        // all. It lives at the choke point rather than in a route so HTTP /query, MCP
+        // run_query and introspection are covered by one check that cannot diverge.
+        //
+        // Deliberately OUTSIDE the allowUnsafeStatements blocks below: that escape hatch
+        // relaxes SQL *shape* guards for a trusted datasource, and must never become a way
+        // to earn write access on one the operator declared read-only.
+        //
+        // Do NOT re-key this on the boot read-only posture verdict. assert-readonly-posture
+        // computes its backstop as "no writable relations AND not superuser AND no
+        // write-all-data role", so EVERY role that can actually write reports WEAK — i.e.
+        // every working write datasource. Gating on it would make writes impossible
+        // everywhere. Posture only observes; `writable` carries the operator's intent.
+        //
+        // Before any DB contact, and audited first: a write aimed at a read-only datasource
+        // is a security event and has to appear in the stream even though it never ran.
+        if (input.write && !dsCfg.writable) {
+            const msg = `datasource "${input.datasource}" is not writable`;
+            this.auditError(input, started, msg);
+            throw new ForbiddenError(msg);
+        }
 
         // Defense-in-depth: reject side-effecting statements/functions (COPY,
         // pg_read_file, …) that a read-only txn does NOT stop, before any DB contact.

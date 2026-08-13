@@ -148,7 +148,10 @@ test('GET /health — 503 degraded when a pool ping fails', async () => {
 test('GET /datasources — lists caps-visible datasources (auth)', async () => {
     const res = await app.inject({ method: 'GET', url: '/datasources', headers: RO });
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(res.json(), [{ name: 'main', defaultSchema: 'public' }]);
+    // `writable` travels with the listing so a caller knows whether a write is even
+    // possible before attempting one. Mirrored by the MCP `list_datasources` tool —
+    // the two shapes are asserted equal in test/mcp-tools.test.ts.
+    assert.deepEqual(res.json(), [{ name: 'main', defaultSchema: 'public', writable: true }]);
 });
 
 test('GET /datasources — 401 without a token', async () => {

@@ -22,10 +22,20 @@ const deniedConfig = makeConfig({
     datasources: [{ ...config.datasources[0], deniedTables: ['user', 'public.role'] }],
 });
 const deniedPools = new PoolManager(deniedConfig.datasources, silentLogger);
+
+// A fourth pool whose 'main' datasource is NOT writable, so the datasource-level write
+// gate applies (same logical name keeps `base` unchanged). The shared fixture is
+// writable:true precisely so the existing write-path tests exercise the TOKEN gates;
+// this one isolates the third gate.
+const readOnlyDsConfig = makeConfig({
+    datasources: [{ ...config.datasources[0], writable: false }],
+});
+const readOnlyDsPools = new PoolManager(readOnlyDsConfig.datasources, silentLogger);
 after(() => {
     pools.drainAll();
     unsafePools.drainAll();
     deniedPools.drainAll();
+    readOnlyDsPools.drainAll();
 });
 
 function svc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit(), ceiling = config.maxRowsCeiling) {
@@ -40,6 +50,11 @@ function unsafeSvc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit(
 /** QueryService whose datasource carries deniedTables (relation guard enforced). */
 function deniedSvc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit()) {
     return { qs: new QueryService(stub, deniedPools, config.maxRowsCeiling, audit), audit };
+}
+
+/** QueryService whose datasource is writable:false (datasource write gate enforced). */
+function readOnlyDsSvc(stub: StubDriver, audit: CapturingAudit = new CapturingAudit()) {
+    return { qs: new QueryService(stub, readOnlyDsPools, config.maxRowsCeiling, audit), audit };
 }
 
 const base = { tokenId: 't', datasource: 'main', schema: 'public' as string };
@@ -388,4 +403,77 @@ test('relation guard: a write to a cross-schema target outside caps → 403 befo
         (e) => e instanceof ForbiddenError && (e as ForbiddenError).status === 403,
     );
     assert.equal(stub.connectCount, 0);
+});
+
+// ── datasource write gate (writable:false) ─────────────────────────────────────
+// The THIRD write gate. The first two — write-mode token, explicit readOnly:false —
+// are token-scoped and live in TokenAuth.authorize; `input.write:true` here already
+// means both of them passed. This one is DATASOURCE-scoped: even a fully authorized
+// write token may not write to a datasource the operator declared read-only.
+
+test('SECURITY: write:true against a writable:false datasource → 403 before any DB contact', async () => {
+    const stub = new StubDriver();
+    const { qs } = readOnlyDsSvc(stub);
+    await assert.rejects(
+        () => qs.run({ ...base, sql: 'INSERT INTO t VALUES (1)', write: true }),
+        (e) => e instanceof ForbiddenError && (e as ForbiddenError).status === 403,
+    );
+    // Zero connects is the real assertion: the gate must reject at the choke point, not
+    // rely on the DB role. A datasource can be writable:false while its role can write.
+    assert.equal(stub.connectCount, 0);
+    assert.equal(stub.sqls().length, 0); // no BEGIN either — nothing was ever sent
+});
+
+test('SECURITY: the datasource write-gate rejection is audited (security stream must see it)', async () => {
+    const stub = new StubDriver();
+    const { qs, audit } = readOnlyDsSvc(stub);
+    await assert.rejects(() => qs.run({ ...base, sql: 'UPDATE t SET a=1', write: true }));
+    assert.equal(audit.entries.length, 1);
+    assert.equal(audit.entries[0].sql, 'UPDATE t SET a=1');
+    assert.equal(audit.entries[0].datasource, 'main');
+    assert.equal(audit.entries[0].write, true); // the blocked attempt is flagged as a write
+    assert.match(audit.entries[0].error ?? '', /not writable/);
+});
+
+test('write:true against a writable:true datasource proceeds (gate is per-datasource, not global)', async () => {
+    const stub = new StubDriver();
+    stub.userResult = { fields: [], rows: [], rowCount: 1, command: 'INSERT' };
+    const { qs, audit } = svc(stub); // shared fixture is writable:true
+    const { response } = await qs.run({ ...base, sql: 'INSERT INTO t VALUES (1)', write: true });
+    assert.equal(stub.connectCount, 1);
+    assert.equal(stub.sqls()[0], 'BEGIN'); // read-write txn, not READ ONLY
+    assert.equal(response.rowsAffected, 1);
+    assert.equal(audit.entries[0].error, undefined);
+});
+
+test('a read against a writable:false datasource is unaffected by the gate', async () => {
+    const stub = new StubDriver();
+    const { qs, audit } = readOnlyDsSvc(stub);
+    await qs.run({ ...base, sql: 'SELECT 1', write: false });
+    assert.equal(stub.connectCount, 1);
+    assert.equal(stub.sqls()[0], 'BEGIN TRANSACTION READ ONLY');
+    assert.ok(stub.userStatements().some((s) => s.sql === 'SELECT 1'));
+    assert.equal(audit.entries[0].error, undefined);
+});
+
+test('maxRowsCeiling stays boot-only: the constructor is unchanged and a reload does not move the clamp', async () => {
+    // Design Decision 9: QueryService takes the ceiling BY VALUE at construction and is
+    // never widened to hold a config reference, so no config replacement can reach it —
+    // that is WHY the knob is boot-only, and there is nothing per-run to re-read.
+    //
+    // Pins REQUIRED arity only: Function.length stops counting at the first defaulted or
+    // optional parameter, so a `cfg?: RootConfig` tacked on would still read 4. It catches
+    // the blunt version of the change, not every version of it.
+    assert.equal(QueryService.length, 4);
+
+    const stub = new StubDriver();
+    stub.userResult = { fields: [], rows: Array.from({ length: 5 }, () => ({})), rowCount: 5, command: 'SELECT' };
+    // Built with a ceiling of 2 while the live config object says 10000: the clamp tracks
+    // the constructor argument, never a config the service could be re-pointed at.
+    const qs = new QueryService(stub, pools, 2, new CapturingAudit());
+    assert.equal(config.maxRowsCeiling, 10000);
+
+    const { response } = await qs.run({ ...base, sql: 'SELECT n', write: false });
+    assert.equal(response.rows.length, 2);
+    assert.equal(response.truncated, true);
 });
