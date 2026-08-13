@@ -40,6 +40,20 @@ export const datasourceSchema = z.object({
     deniedTables: z
         .array(z.string().min(1).regex(/^[^.]+(\.[^.]+)?$/, 'expected "table" or "schema.table"'))
         .default([]),
+    // Datasource-level write gate, enforced at the QueryService choke point — the THIRD
+    // gate, after "write-mode token" and explicit `readOnly:false`. A write reaching a
+    // writable:false datasource is a 403 before any DB contact.
+    //
+    // DELIBERATELY has no `.default()`, and the reason is NOT the one an earlier revision
+    // of this comment gave. There is no per-source asymmetry any more: EVERY loader path
+    // supplies `?? false` (see load-config.ts), because read-only is this gateway's
+    // headline invariant and no config source may make a datasource writable by omission.
+    //
+    // It stays required so that every literal `DatasourceConfig` construction site — in
+    // src/ and, since tsconfig.test.json exists, in test/ too — must STATE its intent and
+    // is caught by the compiler if it does not. A `.default(false)` here would be safe in
+    // direction but would silently let a new construction site skip the decision.
+    writable: z.boolean(),
     // Built-in secure-by-default sensitive-relation denylist (sensitive-relations.ts),
     // merged with deniedTables. Default TRUE: obvious credential/secret/token tables are
     // blocked even when deniedTables is empty. Set false to rely on deniedTables alone.

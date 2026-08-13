@@ -71,15 +71,157 @@ TOKEN_SVC_RW_SECRET=...     TOKEN_SVC_RW_DATASOURCES=main    TOKEN_SVC_RW_MODE=w
   (400) before DB contact. Entries are `table` (matches in ANY schema) or `schema.table`
   (exact); case-insensitive. **Code default is EMPTY** — the gateway is generic, so a
   deployment must declare its own list in `.env` (see `.env.example`); boot logs the count.
+- **Writable:** `DS_<NAME>_WRITABLE` is the **third** write gate, after `TOKEN_*_MODE=write`
+  and an explicit `readOnly:false` on the request. A write reaching a non-writable
+  datasource is a 403 before any DB contact, whatever the token says. **Defaults to
+  `false` from every config source** — `.env`, `datasources.d/`, and the `DATABASE_*`
+  fallback alike. Opt-**in** semantics: only an exact `true` grants it, so a typo leaves
+  the datasource read-only rather than silently writable. Boot logs a WARN naming every
+  datasource this is enabled for. See [Writes](#writes-off-by-default).
 - **DB role:** point each datasource at a **read-only Postgres role**; that, not the
   token mode, is the real write barrier. See [The read-only guarantee](#the-read-only-guarantee-lives-in-the-database).
+
+## Adding a datasource without editing `.env` (`datasources.d/`)
+
+A datasource may live in its own file, so adding one does not mean editing a file that
+also holds every token secret:
+
+```
+datasources.d/warehouse.env        (mode 600)   →  datasource "warehouse"
+```
+
+**The filename is the datasource name** — there is no `NAME` key. The stem must match
+`/^[a-z0-9_-]+$/`. Only `*.env` is read, which is why the shipped template is called
+`example.env.disabled`: it documents the format in place without ever being loaded.
+
+Keys are **bare** — no `DS_<NAME>_` prefix. They are normalized to exactly the
+`DS_<NAME>_*` keys `.env` uses, so every zod default, guard default and the
+`bool()`/`boolSecureDefault()` asymmetry behave identically regardless of which file a
+datasource came from. There is one config model, not two.
+
+```
+HOST=warehouse.internal
+PORT=5432
+USER=agent_ro_pg
+PASSWORD=<secret>
+DATABASE=analytics
+DEFAULT_SCHEMA=public
+DENIED_TABLES=billing_accounts
+# WRITABLE=true      # omitted ⇒ READ-ONLY (as from every config source)
+```
+
+Three rules that are enforced, not advisory:
+
+- **Mode `600` or stricter.** The loader refuses a group- or other-readable file and names
+  the `chmod 600 <path>` fix. There is no CLI to set the mode for you, so this check is the
+  only thing between a default-umask file and a world-readable password.
+- **Unknown keys are rejected.** A stray `TOKENS=` in a datasource file cannot widen
+  anyone's grants. Token grants live in `.env` only.
+- **A name defined in both `.env` and `datasources.d/` refuses the whole reload.** A
+  credential is never silently overridden.
+
+**The directory is read at boot AND on reload**, through the same function, so a datasource
+defined only by a file survives a restart and means the same thing either way. (An earlier
+revision read it only on `SIGHUP`; a directory datasource then evaporated on the next
+restart, or failed boot outright when a token named it.)
+
+`datasources.d/` is git-ignored (`datasources.d/*` plus a negation for the template).
+The directory is resolved CWD-relative, overridable with `DATASOURCES_DIR`. A **missing
+directory is not an error** — the feature is opt-in and every pre-existing config keeps
+booting untouched.
+
+**The `DATABASE_*` fallback survives this.** A zero-config deployment that adds its first
+datasource file keeps its `main` datasource; the fallback is materialized into the merge
+rather than being suppressed by the directory's names.
+
+## Runtime reload (SIGHUP)
+
+Both entrypoints re-read `.env` **and** `datasources.d/` on `SIGHUP` and apply the diff to
+the running process — no restart, no dropped request, no cancelled in-flight query:
+
+```bash
+kill -HUP $(pgrep -f dist/server.js)        # HTTP gateway
+kill -HUP $(pgrep -f dist/mcp/mcp-server.js) # MCP (stdio)
+```
+
+An agent already connected over MCP picks up a new datasource by calling
+`list_datasources` again — no reconnecting `/mcp`.
+
+**Two stages, with deliberately different failure semantics:**
+
+| Stage | Scope | On failure |
+|---|---|---|
+| 1 — validation | permissions, parse, zod, name collision, process identity | **all-or-nothing**: refuses, running config bit-for-bit unchanged |
+| 2 — probes | one `ping` + one posture probe per added/changed datasource | **degrades per datasource**: that one is withheld and logged; siblings still publish |
+
+The only sanctioned difference between boot and reload: an unreachable datasource is
+**fatal at boot** (nothing is serving yet) and **withheld on reload** (something is). The
+server never dies in stage 2.
+
+**Stage 2 has three distinct failure outcomes, and they mean different things about
+availability.** Conflating them is how an operator draws the opposite conclusion:
+
+| Outcome | Serving? | Meaning |
+|---|---|---|
+| `withheld` | **no** | Built but never published — construction, `ping`, or the pre-publish probe failed |
+| `retainedPrevious` | **yes, on the OLD config** | The change could not be applied; the previous pool keeps serving. Retried on the next reload |
+| `postureUnverified` | **yes, on the NEW config** | Swapped and live, but its read-only posture could not be established |
+
+`retainedPrevious` is the one to watch. Change detection is a full config compare, but the
+gate before a swap is a network `SELECT 1` — so a **policy-only tightening** (adding a
+`DENIED_TABLES` entry, revoking `WRITABLE`) can fail on a transient blip, and the failure
+direction is that the **looser previous policy stays live**. It is retried automatically on
+the next reload, and it appears in the summary line, per-datasource warnings, and the
+security event.
+
+A reload is logged as a security event naming what was added/removed/changed/withheld/
+retained — **names only, never values**. The *reasons* are logged as separate
+per-datasource lines, because a `pg` connect error can name a host or user and the security
+event must stay free of them.
+
+Note `ok: true` on a reload means stage 1 passed and the diff was applied — **not** that
+every datasource succeeded. Anything automating against a reload must read the outcome
+lists above, not just the overall result.
+
+**Boot-only keys** cannot be applied to a running process (bound sockets,
+constructor-injected values). They are **compared and warned about** — never applied
+silently, never ignored silently: `PORT`, `HOST`, `LOG_LEVEL`, `MAX_ROWS_CEILING`,
+`HEALTH_CACHE_TTL_MS`, `ALLOW_PUBLIC_BIND`, `MCP_TRANSPORT`, `MCP_HTTP_HOST`,
+`MCP_HTTP_PORT`, `DATASOURCES_DIR`. Restart to change one.
+
+**`MCP_TOKEN` is special.** A reload that would remove the token the MCP process runs as —
+**or merely rotate its secret** — is refused outright, because the process would be left
+unable to authorize its own tool calls. The identity is re-authenticated against the
+candidate token set rather than matched by id, which is what catches the rotation case.
+
+**Windows:** `SIGHUP` is not deliverable. Restart the process instead; everything else
+about the directory format works unchanged.
+
+### Rolling back
+
+Reverting this feature is **not** purely a code revert, because operators may have created
+state the old code cannot read. Do these first:
+
+1. **Inline every `datasources.d/` datasource into `.env`** as `DS_<NAME>_*`, and remove the
+   files. The old code never reads the directory, so a datasource defined only by a file
+   disappears — and if any `TOKEN_<ID>_DATASOURCES` still names it, **boot fails** with
+   `Token "X" references unknown datasource "…"`, an error that points at the token rather
+   than at the directory.
+2. **Keep the `.gitignore` entry**, or delete the credential files before reverting it.
+   Reverting `datasources.d/*` un-ignores files that are still on disk holding live database
+   passwords, so a later `git add -A` can commit them. This is the one genuinely dangerous
+   one-way step.
+
+Everything else rolls back cleanly. `WRITABLE` rolls back *looser* — the old schema has no
+such field, so writes resume and leftover `DS_<NAME>_WRITABLE` keys are simply unread. No
+database migrations are involved; all merged config state is derived, nothing is persisted.
 
 ## HTTP API
 
 | Method + path            | Auth | Purpose |
 |--------------------------|------|---------|
 | `GET  /health`           | no   | `{ status, datasources:[{name, ok, poolSize}] }` (503 if degraded) |
-| `GET  /datasources`      | yes  | datasources this token may use |
+| `GET  /datasources`      | yes  | `[{name, defaultSchema, writable}]` this token may use — same shape as MCP `list_datasources` |
 | `POST /query`            | yes  | run one statement |
 | `POST /introspect/schemas`  | yes | schemas visible to the token |
 | `POST /introspect/tables`   | yes | `{ datasource, schema }` → tables + views |
@@ -94,19 +236,46 @@ Auth is `Authorization: Bearer <secret>`. `POST /query` body:
 
 Response: `{ columns:[{name,dataType}], rows:[...], rowCount, truncated, elapsedMs, rowsAffected? }`.
 
-### Writes (opt-in)
+### Writes (off by default)
 
-A write requires **both** a write-mode token **and** an explicit `"readOnly": false`. A
-read-only token with `readOnly:false` is rejected (403) before any DB contact. Write
-queries add `write:true`, `command`, and `rowsAffected` to the audit line.
+**This gateway is read-only unless three independent things are all turned on**, and none
+of them is on in a stock install:
+
+| # | Gate | Default | Where |
+|---|---|---|---|
+| 1 | a write-mode token | `TOKEN_*_MODE=read`; `.env.example` ships **no** write token | `TokenAuth.authorize` |
+| 2 | the datasource is writable | `DS_<NAME>_WRITABLE` unset ⇒ **false**, from every config source | `QueryService.run` |
+| 3 | the request opts in | `readOnly` defaults **true** | `TokenAuth.authorize` |
+
+Any one of them missing is a **403 before any DB contact**. All three are opt-**in**: each
+uses exact-`true` matching, so a typo (`1`, `yes`, `on`) leaves you read-only rather than
+silently writable — the deliberate inverse of the secure-by-default toggles, where a typo
+keeps the safety net *on*. Both conventions converge on "a mistake leaves you safer".
+
+Boot logs a **WARN naming every writable datasource**, so a gateway that can write says so
+on every start rather than only in a `.env` nobody re-reads.
+
+Write queries add `write:true`, `command`, and `rowsAffected` to the audit line.
+
+None of this replaces the real barrier: **point the datasource at a read-only DB role.**
+App-layer gates are what this process controls; DB grants are what actually stops a write.
+See [The read-only guarantee lives in the database](#the-read-only-guarantee-lives-in-the-database).
 
 ## MCP adapter
 
-Exposes `run_query`, `list_schemas`, `list_tables`, `describe_table` over MCP — thin
-wrappers over the SAME services, so all guardrails/auth/audit apply identically.
+Exposes `run_query`, `list_datasources`, `list_schemas`, `list_tables`, `describe_table`
+over MCP — thin wrappers over the SAME services, so all guardrails/auth/audit apply
+identically.
+
+`list_datasources` returns `{name, defaultSchema, writable}` for each datasource this
+token may use — the same shape as HTTP `GET /datasources`, asserted equal by a test so
+the two transports cannot drift. It is the **current-state** path: datasource names can
+change at runtime (see [Runtime reload](#runtime-reload-sighup)), so `instructions` no
+longer enumerate them — a cached instruction string would go stale the moment a reload
+happened.
 
 The server also advertises usage **`instructions`** (built from the live identity — the
-datasource list and read/write posture are accurate, not aspirational). MCP clients like
+read/write posture is accurate, not aspirational). MCP clients like
 Claude Code surface these in the agent's system prompt, so **any project that registers
 the server gets the usage guidance automatically** ("prefer over ad-hoc psql", the
 datasource name, the params-not-literals rule) — no per-project CLAUDE.md rule to write
@@ -147,7 +316,9 @@ npm run dev         # tsx watch (HTTP server)
 npm run build       # tsc → dist/
 npm start           # node dist/server.js  (HTTP)
 npm run start:mcp   # MCP over stdio
-npm run typecheck
+npm run typecheck      # src/ only (what the build uses)
+npm run typecheck:test # test/ (tsconfig.test.json)
+npm run typecheck:all  # both — the static gate; there is no linter
 npm test            # node --test via tsx
 ```
 
@@ -495,3 +666,14 @@ The row cap is enforced by fetching the result and slicing to `maxRows` (`trunca
 if exceeded), rather than a server-side cursor. For this trusted-caller utility that is
 bounded in practice by `statement_timeout` + the row ceiling; a cursor-based bounded fetch
 is a possible future optimization.
+
+**Reload is signal-driven, not watched.** There is deliberately no `fs.watch`: watchers are
+inconsistent across platforms and fire mid-write on partially-written files — which for a
+credential file means loading half a password. A signal is explicit, atomic and scriptable.
+A watcher stays cheap to add later precisely because reload is already atomic-or-nothing.
+
+**`SIGHUP` is undeliverable on Windows**, so reload there means restarting the process.
+
+**A key deleted from `.env` since boot is not unset by a reload.** The merged candidate is
+built over the live environment, and node loaded `.env` into it at boot, so the old value
+survives. Changing a value works; removing one entirely needs a restart.

@@ -1,6 +1,7 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config/load-config.js';
+import { datasourceSchema } from '../src/config/config.schema.js';
 
 // load-config reads process.env; snapshot + restore around each test.
 const KEYS = Object.keys(process.env);
@@ -152,6 +153,127 @@ test('SENSITIVE_RELATION_DENYLIST=false turns the built-in off', () => {
     process.env.DS_MAIN_SENSITIVE_RELATION_DENYLIST = 'false';
     assert.equal(loadConfig().datasources[0].sensitiveRelationDenylist, false);
     delete process.env.DS_MAIN_SENSITIVE_RELATION_DENYLIST;
+});
+
+/** Minimal valid env as a PLAIN OBJECT, for the injected-source cases below. */
+function minimalSource(extra: Record<string, string> = {}): Record<string, string | undefined> {
+    return {
+        DATASOURCES: 'main',
+        DS_MAIN_HOST: 'injected.local',
+        DS_MAIN_USER: 'u',
+        DS_MAIN_DATABASE: 'd',
+        TOKENS: 't',
+        TOKEN_T_SECRET: 's',
+        TOKEN_T_DATASOURCES: 'main',
+        TOKEN_T_SCHEMAS: '*',
+        ...extra,
+    };
+}
+
+test('loadConfig(source) reads the injected map, NOT process.env', () => {
+    reset();
+    // Deliberately contradictory: process.env names a different host and datasource.
+    // If the loader leaks back to process.env, one of these assertions fails.
+    process.env.DATASOURCES = 'ghost';
+    process.env.DS_GHOST_HOST = 'from-process-env.local';
+    process.env.DS_GHOST_USER = 'u';
+    process.env.DS_GHOST_DATABASE = 'd';
+
+    const cfg = loadConfig(minimalSource());
+    assert.equal(cfg.datasources.length, 1);
+    assert.equal(cfg.datasources[0].name, 'main');
+    assert.equal(cfg.datasources[0].host, 'injected.local');
+});
+
+test('loadConfig() defaults to process.env when no source is passed', () => {
+    minimalEnv();
+    process.env.DS_MAIN_HOST = 'from-process-env.local';
+    assert.equal(loadConfig().datasources[0].host, 'from-process-env.local');
+});
+
+test('injected source preserves DATABASE_* fallback, cross-reference and boolSecureDefault behaviour', () => {
+    reset();
+    // DATABASE_* fallback under injection (no DS_* keys in the map).
+    const fallback = loadConfig({
+        DATABASE_HOST: 'canon.injected',
+        DATABASE_USERNAME: 'canon',
+        DATABASE_NAME: 'canondb',
+        TOKENS: 't',
+        TOKEN_T_SECRET: 's',
+        TOKEN_T_DATASOURCES: 'main',
+        TOKEN_T_SCHEMAS: '*',
+    });
+    assert.equal(fallback.datasources[0].name, 'main');
+    assert.equal(fallback.datasources[0].host, 'canon.injected');
+
+    // Token cross-reference failure still throws under injection.
+    assert.throws(() => loadConfig(minimalSource({ TOKEN_T_DATASOURCES: 'ghost' })), /unknown datasource "ghost"/);
+
+    // boolSecureDefault asymmetry survives injection: a typo keeps the net ON.
+    assert.equal(loadConfig(minimalSource({ DS_MAIN_SENSITIVE_RELATION_DENYLIST: '1' })).datasources[0].sensitiveRelationDenylist, true);
+    assert.equal(loadConfig(minimalSource({ DS_MAIN_SENSITIVE_RELATION_DENYLIST: 'off' })).datasources[0].sensitiveRelationDenylist, false);
+});
+
+// ---------------------------------------------------------------------------
+// `writable` — required in the schema, and FAIL-CLOSED from every config source.
+// There is no per-source asymmetry: .env, datasources.d/ and the DATABASE_*
+// fallback all default to read-only, so a datasource can only become writable by
+// an operator saying so explicitly, in writing, on that datasource.
+// ---------------------------------------------------------------------------
+
+test('SECURITY: `writable` is REQUIRED — a datasource omitting it fails to parse', () => {
+    const withoutWritable = {
+        name: 'main',
+        host: 'h',
+        user: 'u',
+        database: 'd',
+        password: '',
+    };
+    assert.equal(datasourceSchema.safeParse(withoutWritable).success, false);
+    // ...and the same object parses once writable is supplied, proving nothing
+    // ELSE in the fixture is what made it fail.
+    assert.equal(datasourceSchema.safeParse({ ...withoutWritable, writable: true }).success, true);
+});
+
+test('SECURITY: .env DS_X_WRITABLE absent ⇒ writable FALSE (fail-closed everywhere)', () => {
+    // Deliberately NOT backward compatible. This gateway's headline invariant is that it
+    // is read-only, so a datasource must never become writable by omission — an operator
+    // who wants writes says so, on the datasource, in writing.
+    assert.equal(loadConfig(minimalSource()).datasources[0].writable, false);
+});
+
+test('.env DS_X_WRITABLE=false ⇒ writable false', () => {
+    assert.equal(loadConfig(minimalSource({ DS_MAIN_WRITABLE: 'false' })).datasources[0].writable, false);
+});
+
+test('SECURITY: every source defaults the same way — there is no per-source asymmetry left', () => {
+    // .env, datasources.d/ and the DATABASE_* fallback all fail closed. One rule, one
+    // place: three coordinated defaults would be three chances to reopen the hole.
+    assert.equal(loadConfig(minimalSource()).datasources[0].writable, false);
+    assert.equal(loadConfig(minimalSource({ DS_MAIN_WRITABLE: 'true' })).datasources[0].writable, true);
+});
+
+test('SECURITY: DATABASE_* fallback datasource ⇒ writable FALSE too', () => {
+    reset();
+    const cfg = loadConfig({
+        DATABASE_HOST: 'canon.local',
+        DATABASE_USERNAME: 'canon',
+        DATABASE_NAME: 'canondb',
+        TOKENS: 't',
+        TOKEN_T_SECRET: 's',
+        TOKEN_T_DATASOURCES: 'main',
+        TOKEN_T_SCHEMAS: '*',
+    });
+    assert.equal(cfg.datasources[0].writable, false);
+});
+
+test('WRITABLE uses plain bool(): a typo is NOT treated as true', () => {
+    // bool() (not boolSecureDefault) is correct here — this is an opt-IN to a
+    // dangerous capability, so anything that isn't exactly "true" must not grant it.
+    for (const v of ['1', 'yes', 'on', 'TRUE']) {
+        const cfg = loadConfig(minimalSource({ DS_MAIN_WRITABLE: v }));
+        assert.equal(cfg.datasources[0].writable, v === 'TRUE', `value=${v}`);
+    }
 });
 
 test('SENSITIVE_RELATION_DENYLIST is fail-CLOSED: a typo like "1" keeps it ON', () => {

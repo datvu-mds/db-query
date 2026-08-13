@@ -4,5 +4,14 @@ dist/
 .env
 .env.*
 !.env.example
+# Datasource credential files. The .env patterns above match on BASENAME, and
+# `warehouse.env` starts with neither ".env" nor ".env." — so without this line the
+# feature's own credential files would be committable by default.
+#
+# `datasources.d/*`, NOT `datasources.d/`: git cannot re-include a file whose PARENT
+# DIRECTORY is excluded, so the directory form would silently swallow the negation
+# below and the tracked template with it. Verified both ways with `git check-ignore`.
+datasources.d/*
+!datasources.d/example.env.disabled
 .DS_Store
 docs/risks/

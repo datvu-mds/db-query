@@ -33,6 +33,11 @@ export function makeConfig(overrides: Partial<RootConfig> = {}): RootConfig {
                 connectionTimeoutMs: 5000,
                 maxUses: 7500,
                 allowUnsafeStatements: false,
+                // Writable in the shared fixture so the existing write-path tests keep
+                // exercising the TOKEN gates (mode + readOnly:false) rather than being
+                // short-circuited by the datasource gate. The gate has its own coverage
+                // in the query-service write-gate group, which overrides this to false.
+                writable: true,
                 deniedTables: [],
                 // Off in the shared fixture so existing tests exercise the config
                 // denylist / caps in isolation; the built-in has its own opt-in tests.

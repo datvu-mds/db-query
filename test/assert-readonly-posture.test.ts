@@ -1,11 +1,38 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import pino from 'pino';
-import { assertReadOnlyPosture } from '../src/boot/assert-readonly-posture.js';
-import { buildServices } from '../src/services.js';
 import { makeConfig, StubDriver, emptyResult } from './helpers.js';
 import type { RootConfig } from '../src/config/config.schema.js';
 import type { Services } from '../src/services.js';
+
+/**
+ * Counting wrapper around libpg-query's `parse` — the ONLY way to observe the boot
+ * warm-up. On success `extractSqlRefs('SELECT 1')` has no external effect, and
+ * libpg-query starts its own WASM init at import time, so "the parser works
+ * afterwards" proves nothing about whether the warm-up ran.
+ *
+ * libpg-query is CJS: its named ESM import is SNAPSHOTTED when `relation-guard` is
+ * first linked, so this wrapper must be installed BEFORE that link — hence the
+ * dynamic imports below. (Verified: patching after the link counts 0 calls.)
+ *
+ * INVARIANT: no static import in this file may reach libpg-query. Today only
+ * `../src/boot/assert-readonly-posture.js` and `../src/services.js` do (via
+ * query-service → relation-guard); `./helpers.js` does not. Adding such a static
+ * import makes the "boot still warms the parser" assertion count 0 and fail loudly
+ * rather than silently pass.
+ */
+const nodeRequire = createRequire(import.meta.url);
+const libpg = nodeRequire('libpg-query') as { parse: (sql: string) => Promise<unknown> };
+const realParse = libpg.parse;
+let parseCalls = 0;
+libpg.parse = (sql: string) => {
+    parseCalls++;
+    return realParse(sql);
+};
+
+const { assertReadOnlyPosture } = await import('../src/boot/assert-readonly-posture.js');
+const { buildServices } = await import('../src/services.js');
 
 interface Line extends Record<string, unknown> {
     level: number;
@@ -245,4 +272,180 @@ test('every probe column alias is lower-case, so row lookups cannot miss', async
     for (const alias of aliases) {
         assert.equal(alias, alias.toLowerCase(), `alias "${alias}" would be case-folded by Postgres`);
     }
+});
+
+// --- opts: subset probing + warm-up control (the reload path) -----------------
+// Reload calls this per diff. Without a subset, adding ONE datasource re-probes every
+// datasource (up to PROBE_TIMEOUT_MS each) and re-emits the whole posture log, so these
+// assert PROBE COUNT — a regression here must fail a test, not merely make reload slow.
+
+/** Two datasources off the shared fixture, so a new required DatasourceConfig field
+ *  cannot silently miss the second one. Only `main` has a write-mode token. */
+function twoDatasourceConfig(): RootConfig {
+    const base = makeConfig().datasources[0];
+    return makeConfig({ datasources: [base, { ...base, name: 'other' }] });
+}
+
+/** Every posture verdict line, in order, so we can assert WHICH datasources were probed
+ *  (StubDriver.connect ignores the name, so a count alone cannot prove identity). */
+const postureLines = (lines: Line[]): Line[] => lines.filter((l) => typeof l.msg === 'string' && l.msg.includes('read-only posture'));
+
+test('opts.only probes exactly the named datasources — an unaffected one is never re-probed', async () => {
+    const { services, lines, stub } = setup({ config: twoDatasourceConfig() });
+    await assertReadOnlyPosture(services, undefined, { only: ['other'] });
+
+    assert.equal(stub.connectCount, 1, 'exactly one probe — reload cost must track the diff, not the datasource count');
+    assert.deepEqual(
+        postureLines(lines).map((l) => l.datasource),
+        ['other'],
+    );
+});
+
+test('omitting opts probes every datasource — boot behaviour unchanged', async () => {
+    const { services, lines, stub } = setup({ config: twoDatasourceConfig() });
+    await assertReadOnlyPosture(services);
+
+    assert.equal(stub.connectCount, 2);
+    assert.deepEqual(
+        postureLines(lines).map((l) => l.datasource),
+        ['main', 'other'],
+    );
+});
+
+// `opts.only?.length ? only : names()` would silently re-probe EVERYTHING for a reload
+// whose diff is empty — the exact regression this parameter exists to prevent.
+test('an empty opts.only probes nothing — it never falls back to every datasource', async () => {
+    const { services, lines, stub } = setup({ config: twoDatasourceConfig() });
+    await assertReadOnlyPosture(services, undefined, { only: [] });
+
+    assert.equal(stub.connectCount, 0);
+    assert.deepEqual(postureLines(lines), []);
+});
+
+// FAIL CLOSED. `only` is deliberately NOT filtered against names() (a reload probes a
+// STAGED datasource, resolvable but not yet routable), so an unresolvable name must be
+// reported, never dropped in silence — and must not abort the rest of the subset.
+test('a name in opts.only that resolves to no datasource is UNVERIFIED, never OK, and never throws', async () => {
+    const { services, lines, stub } = setup({ config: twoDatasourceConfig() });
+    await assert.doesNotReject(() => assertReadOnlyPosture(services, 'agent_ro', { only: ['ghost', 'other'] }));
+
+    const line = lines.find((l) => l.msg.includes('UNVERIFIED'))!;
+    assert.ok(line, 'an UNVERIFIED line was logged for the unresolvable name');
+    assert.equal(line.level, WARN);
+    assert.equal(line.datasource, 'ghost');
+    assert.match(line.msg, /read-only posture/);
+
+    // Nothing else may be said about a datasource that does not exist — a refactor that
+    // hoisted the guard-status logging above the resolve would announce "relation guard
+    // ENFORCED for datasource ghost" about a datasource nobody configured.
+    assert.equal(
+        lines.some((l) => typeof l.msg === 'string' && l.msg.includes('"ghost"')),
+        false,
+        'no guard-status line for a datasource that does not resolve',
+    );
+
+    // The rest of the subset is still probed, exactly once.
+    assert.equal(stub.connectCount, 1);
+    const ok = lines.find((l) => l.msg.includes('posture OK'))!;
+    assert.equal(ok.datasource, 'other');
+});
+
+test('the parser warm-up runs at boot, is skipped on warmParser:false, and defaults to true', async () => {
+    const { services } = setup({ config: readOnlyTokenConfig() });
+
+    parseCalls = 0;
+    await assertReadOnlyPosture(services, undefined, { warmParser: false });
+    assert.equal(parseCalls, 0, 'reload must not re-pay the WASM warm-up');
+
+    parseCalls = 0;
+    await assertReadOnlyPosture(services);
+    assert.equal(parseCalls, 1, 'boot still warms the parser so the first user query does not pay for it');
+
+    parseCalls = 0;
+    await assertReadOnlyPosture(services, undefined, { only: ['main'] });
+    assert.equal(parseCalls, 1, 'warmParser defaults to true when opts omits it');
+});
+
+// --- datasource write gate visibility -------------------------------------------
+// WRITABLE is off by default from every config source, so a writable datasource is
+// always a deliberate act. Deliberate acts that re-open a write path must be as loud
+// at boot as ALLOW_UNSAFE_STATEMENTS — otherwise the only record that a gateway
+// advertised as read-only can in fact write is one line in a .env nobody re-reads.
+
+const writableWarn = (lines: Line[]): Line | undefined =>
+    lines.find((l) => typeof l.msg === 'string' && l.msg.includes('is WRITABLE'));
+
+test('SECURITY: a writable datasource produces a boot WARN naming it', async () => {
+    const cfg = makeConfig(); // shared fixture is writable:true
+    const { services, lines } = setup({ config: cfg });
+    await assertReadOnlyPosture(services);
+
+    const warn = writableWarn(lines);
+    assert.ok(warn, 'a writable datasource must be announced at boot');
+    assert.equal(warn.level, WARN, 'must be WARN, not INFO — this re-opens a write path');
+    assert.equal(warn.datasource, 'main');
+    assert.equal(warn.writable, true);
+});
+
+test('a read-only datasource produces NO writable warn (the default must be quiet)', async () => {
+    // If the default were noisy, operators would learn to ignore the line that matters.
+    const cfg = makeConfig({ datasources: [{ ...makeConfig().datasources[0], writable: false }] });
+    const { services, lines } = setup({ config: cfg });
+    await assertReadOnlyPosture(services);
+
+    assert.equal(writableWarn(lines), undefined);
+});
+
+// --- upgrade safety net: write tokens with nothing writable ----------------------
+// WRITABLE now defaults FALSE from every source, which is deliberate but NOT backward
+// compatible. Without this warning the only signal an upgraded deployment gets is a 403
+// on whatever production write happens to run first.
+
+const unreachableWarn = (lines: Line[]): Line | undefined =>
+    lines.find((l) => typeof l.msg === 'string' && l.msg.includes('NO datasource is writable'));
+
+test('SECURITY: write tokens + nothing writable warns at boot, naming the tokens', async () => {
+    const cfg = makeConfig({ datasources: [{ ...makeConfig().datasources[0], writable: false }] });
+    const { services, lines } = setup({ config: cfg }); // makeConfig ships a write-mode svc_rw
+    await assertReadOnlyPosture(services);
+
+    const warn = unreachableWarn(lines);
+    assert.ok(warn, 'an upgraded deployment must be told its write path is closed');
+    assert.equal(warn.level, WARN);
+    assert.deepEqual(warn.writeTokens, ['svc_rw']);
+    assert.match(String(warn.msg), /DS_<NAME>_WRITABLE=true/, 'must name the fix');
+});
+
+test('no warning when at least one datasource IS writable', async () => {
+    const { services, lines } = setup({ config: makeConfig() }); // fixture is writable:true
+    await assertReadOnlyPosture(services);
+    assert.equal(unreachableWarn(lines), undefined);
+});
+
+test('no warning when there are no write-mode tokens (an intentionally read-only gateway)', async () => {
+    // The common, correct configuration must stay silent — a warning that fires for
+    // everyone is one operators learn to skip past.
+    const cfg = makeConfig({
+        datasources: [{ ...makeConfig().datasources[0], writable: false }],
+        tokens: [{ id: 'agent_ro', secret: 's', datasources: ['main'], mode: 'read', schemas: ['*'] }],
+    });
+    const { services, lines } = setup({ config: cfg });
+    await assertReadOnlyPosture(services);
+
+    assert.equal(unreachableWarn(lines), undefined);
+});
+
+test('the writes-unreachable warning is BOOT-only — a reload subset must not claim it', async () => {
+    // On reload `only` is the DIFF. Warning from a one-element subset would assert
+    // "NO datasource is writable" while other writable datasources are live and serving.
+    const cfg = makeConfig({
+        datasources: [
+            { ...makeConfig().datasources[0], name: 'ro_one', writable: false },
+            { ...makeConfig().datasources[0], name: 'writable_one', writable: true },
+        ],
+    });
+    const { services, lines } = setup({ config: cfg });
+    await assertReadOnlyPosture(services, undefined, { only: ['ro_one'], warmParser: false });
+
+    assert.equal(unreachableWarn(lines), undefined, 'a reload subset must not conclude anything about the fleet');
 });

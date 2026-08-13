@@ -82,6 +82,45 @@ export function registerTools(server: McpServer, s: Services, caps: Capabilities
     );
 
     server.registerTool(
+        'list_datasources',
+        {
+            title: 'List datasources',
+            description:
+                'List the datasources this identity may use: {name, defaultSchema, writable}. Call this ' +
+                'first to discover valid `datasource` values — the server instructions do NOT list them, ' +
+                'because a config reload can add or remove one at any time. `writable:false` means every ' +
+                'write to that datasource is rejected regardless of token, so do not attempt one.',
+            // An explicit empty shape, not an omitted `inputSchema`: the SDK switches the
+            // handler arity on its presence (args, extra) vs (extra). Keeping it makes this
+            // tool's handler signature identical to the other four.
+            inputSchema: {},
+        },
+        async () => {
+            try {
+                // Read through pools (NOT services.config.datasources) at call time: a
+                // reload mutates PoolManager in place while this closure keeps the
+                // Services reference it captured at registration, so a snapshot here —
+                // or a read of the config field — would go stale the moment one lands.
+                // Caps-filtered with the same datasourceAllowed() the HTTP route and
+                // authorize() use, so '*' cannot be interpreted three different ways.
+                const datasources = s.pools
+                    .names()
+                    .filter((name) => s.auth.datasourceAllowed(caps, name))
+                    .map((name) => {
+                        const cfg = s.pools.getConfig(name);
+                        return { name, defaultSchema: cfg.defaultSchema, writable: cfg.writable };
+                    });
+                // Element shape is deliberately identical to GET /datasources
+                // (routes/datasources.route.ts); only the envelope differs, and
+                // test/mcp-tools.test.ts asserts the two equal so they cannot drift.
+                return ok({ datasources });
+            } catch (e) {
+                return fail(redactErrorMessage(e));
+            }
+        },
+    );
+
+    server.registerTool(
         'list_schemas',
         {
             title: 'List schemas',
