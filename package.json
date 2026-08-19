@@ -14,6 +14,7 @@
         "start:mcp": "node --env-file-if-exists=.env dist/mcp/mcp-server.js",
         "start:mcp:http": "MCP_TRANSPORT=http node --env-file-if-exists=.env dist/mcp/mcp-server.js",
         "inspect": "npm run build && npx @modelcontextprotocol/inspector node --env-file-if-exists=.env dist/mcp/mcp-server.js",
+        "check:config": "node --import tsx scripts/check-config.mts",
         "typecheck": "tsc --noEmit -p tsconfig.json",
         "typecheck:test": "tsc --noEmit -p tsconfig.test.json",
         "typecheck:all": "npm run typecheck && npm run typecheck:test",

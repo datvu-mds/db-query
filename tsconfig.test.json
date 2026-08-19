@@ -7,6 +7,9 @@
 // runtime failure, or not at all. This config closes that gap: same strictness,
 // no emit, and `test/**` in scope.
 //
+// `scripts/**` is in scope for the same reason: it is run with `tsx`, so nothing else
+// would ever type-check it.
+//
 // Run via `npm run typecheck:test` (or `npm run typecheck:all` for both).
 {
     "extends": "./tsconfig.json",
@@ -16,6 +19,6 @@
         // errors as soon as a `test/**` file enters the program.
         "rootDir": "."
     },
-    "include": ["src/**/*.ts", "test/**/*.ts"],
+    "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.mts"],
     "exclude": ["node_modules", "dist"]
 }
