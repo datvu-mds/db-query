@@ -4,6 +4,10 @@ dist/
 .env
 .env.*
 !.env.example
+# The `.env` for a datasources.d/-based deployment: server keys + token grants only,
+# no DS_* blocks. Tracked as a template alongside .env.example, which documents the
+# other layout. Holds placeholders only — real credentials go in `.env`, still ignored.
+!.env.multi.example
 # Datasource credential files. The .env patterns above match on BASENAME, and
 # `warehouse.env` starts with neither ".env" nor ".env." — so without this line the
 # feature's own credential files would be committable by default.
@@ -15,3 +19,12 @@ datasources.d/*
 !datasources.d/example.env.disabled
 .DS_Store
 docs/risks/
+.ai-devkit.json
+# Local agent tooling. `.claude/*`, NOT `.claude/`, for the same reason as
+# `datasources.d/*` above: git cannot re-include a file whose PARENT DIRECTORY is
+# excluded, and `.claude/agent-memory/code-reviewer/` is TRACKED — four writeups of
+# real guard bypasses that CLAUDE.md tells contributors to read before touching the
+# guards. The directory form would silently swallow the negation, so a fifth writeup
+# would never become committable. Verified both ways with `git check-ignore`.
+.claude/*
+!.claude/agent-memory/
