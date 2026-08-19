@@ -126,7 +126,9 @@ revision read it only on `SIGHUP`; a directory datasource then evaporated on the
 restart, or failed boot outright when a token named it.)
 
 `datasources.d/` is git-ignored (`datasources.d/*` plus a negation for the template).
-The directory is resolved CWD-relative, overridable with `DATASOURCES_DIR`. A **missing
+The directory is resolved CWD-relative, overridable with `DATASOURCES_DIR` — which an MCP
+client entry **must** set to an absolute path, since the client chooses the cwd (see
+[Registering it in an MCP client](#registering-it-in-an-mcp-client)). A **missing
 directory is not an error** — the feature is opt-in and every pre-existing config keeps
 booting untouched.
 
@@ -285,10 +287,56 @@ clients, add a short project rule too.
 
 - Identity is process-level: set `MCP_TOKEN=<a configured secret>`; the process runs with
   that token's capabilities.
+- **A client-spawned server needs `DATASOURCES_DIR` as an absolute path.** See
+  [Registering it in an MCP client](#registering-it-in-an-mcp-client) — this bites any
+  deployment whose datasources live in `datasources.d/`.
 - `npm run start:mcp` — stdio (default; for a local agent client).
 - `npm run start:mcp:http` — streamable HTTP (`MCP_TRANSPORT=http`), binds loopback by
   default (`MCP_HTTP_HOST`/`MCP_HTTP_PORT`). Never expose publicly — trusted infra utility.
 - `npm run inspect` — MCP inspector against the built server.
+
+### Registering it in an MCP client
+
+An MCP client spawns this process with **its own working directory** — usually the
+client's, not this one. `datasources.d/` is resolved CWD-relative, so a hand-written entry
+that names only the entry point finds **no** datasources and dies at boot:
+
+```
+[pg-connection-pool-mcp] fatal: Invalid pg-connection-pool config (check .env):
+  - datasources: Array must contain at least 1 element(s)
+```
+
+The client shows only `Connection closed`; the real reason is on the server's stderr, and
+the error names `.env` rather than the directory it could not find. An absolute
+`--env-file-if-exists` does **not** fix it — that loads token grants and `MCP_TOKEN`,
+while the datasource *directory* is a separate lookup. Pass it explicitly:
+
+```jsonc
+"pg-connection-pool": {
+  "type": "stdio",
+  "command": "node",
+  "args": [
+    "--env-file-if-exists=/abs/path/to/db-query/.env",
+    "/abs/path/to/db-query/dist/mcp/mcp-server.js"
+  ],
+  "env": { "DATASOURCES_DIR": "/abs/path/to/db-query/datasources.d" }
+}
+```
+
+`install-mcp.sh` emits this block for you, `env` included — prefer it over hand-writing
+one. Setting `DATASOURCES_DIR` in `.env` instead works identically, since
+`--env-file-if-exists` loads it before the lookup happens; the client config is preferred
+only because it keeps the absolute path beside the other absolute paths it must agree
+with, and needs no `cwd` support from the client.
+
+Two consequences of the stdio model worth planning for:
+
+- **It runs `dist/`, so rebuild after editing `src/`.** A stale `dist/` produces no error,
+  just old behaviour.
+- **Boot pings every datasource**, so an unreachable cluster at spawn time fails the whole
+  connection rather than degrading. Once running, a `SIGHUP` reload withholds an
+  unreachable datasource instead — but the initial spawn has no such grace. On a laptop
+  that moves between networks, expect this.
 
 ### Quick install into any project
 
