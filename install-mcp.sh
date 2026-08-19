@@ -58,12 +58,27 @@ while [ $# -gt 0 ]; do
 done
 
 # ── build the server entry (absolute path → works from any project) ──
+#
+# DATASOURCES_DIR is emitted as an absolute path, and it is NOT optional. An MCP client
+# spawns this process with ITS OWN cwd, but `datasources.d/` is resolved CWD-relative
+# (config/datasources-dir.ts) — so without this, a deployment whose datasources live in
+# that directory finds none of them and dies at boot with
+# "datasources: Array must contain at least 1 element(s)", an error that names .env
+# rather than the directory it could not find. The client only sees "Connection closed".
+#
+# The absolute `--env-file-if-exists` does NOT cover this: that loads token grants and
+# MCP_TOKEN into the environment, while the datasource DIRECTORY is a separate lookup.
+#
+# Emitted unconditionally, even when the directory does not exist yet — a missing
+# directory is not an error, and hard-coding it now means a datasource file added later
+# is picked up without re-running the installer.
 ENTRY="$ROOT/dist/mcp/mcp-server.js"
 server_json() {
     jq -n \
         --arg env "--env-file-if-exists=$ROOT/.env" \
         --arg entry "$ENTRY" \
-        '{type:"stdio", command:"node", args:[$env, $entry]}'
+        --arg dsdir "$ROOT/datasources.d" \
+        '{type:"stdio", command:"node", args:[$env, $entry], env:{DATASOURCES_DIR:$dsdir}}'
 }
 
 if $PRINT_ONLY; then
